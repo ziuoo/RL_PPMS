@@ -1,0 +1,4 @@
+string keyword
+---
+bool success
+string message
