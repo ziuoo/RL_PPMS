@@ -10,8 +10,11 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ObjectDepth.msg"
   "msg/ObjectDepthArray.msg"
   "srv/SetTarget.srv"
-  "srv/MoveToPoint.srv"
+  "srv/TargetPosition.srv"
   "srv/TargetCenter.srv"
+  "srv/TargetPose.srv"
+  "srv/GripperValue.srv"
+  "srv/MoveDone.srv"
   DEPENDENCIES std_msgs geometry_msgs
 )
 
