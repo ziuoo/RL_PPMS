@@ -1,59 +1,116 @@
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import Point, TransformStamped 
-from cv_bridge import CvBridge
+#!/usr/bin/env python3
 import cv2
-import numpy as np
-import math
+import rclpy
 import tf2_ros
+import numpy as np
+
+from rclpy.node import Node
+from cv_bridge import CvBridge
 from tf2_ros import TransformBroadcaster
-from system_interfaces.srv import MoveToPoint, TargetCenter
+from sensor_msgs.msg import Image, CameraInfo
+from system_interfaces.srv import TargetCenter, TargetPosition
 
 class PixelToWorld(Node):
     def __init__(self):
         super().__init__('pixel_to_world')
-
-        # self.declare_parameter('depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
-        self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
-        self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
-        self.declare_parameter('target_frame', 'world')
-
-        # self.depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
-        self.image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
-        self.camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
-        self.target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
-
+        
+        self.init_variables()
+        self.init_pubsub_and_srv()
+        
+        self.timer = self.create_timer(0.1, self.main)
+        
+#%% Initialization functions
+    def init_variables(self):
+        self.bridge = CvBridge()
+        self.camera_info = None
+        self.image_msg = None
+        
         self.pixel_t = None
         self.pixel_u = None
         self.pixel_v = None
         self.pixel_d = None
         
-        # 🚩 계산 완료 플래그 (한 번만 계산하도록)
-        self.calculation_done = True  # 처음엔 True (대기 상태)
+        self.calculation_done = True
+        
+        # Camera World Position (m)
+        self.camera_position = np.array([0.53, 0.03, 0.98])
+        
+        self.theta_x = np.pi
+        self.theta_y = 0.0
+        self.theta_z = np.pi / 2.0
+        
+    def init_pubsub_and_srv(self):
+        # ---------------- Subscription ----------------
+        self.create_subscription(Image, '/camera/camera/color/image_raw', self.cbtp_rgb, 10)
+        self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.cbtp_info, 10)
+        
+        # ---------------- Service ----------------
+        self.target_center_srv = self.create_service(TargetCenter, '/e0509/target_center', self.cbsrv_target_center)
+        self.target_position_client = self.create_client(TargetPosition, '/e0509/target_position')
 
+        # 서비스 준비될 때까지 계속 대기 (비동기)
+        while not self.target_position_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn('TargetPosition 서비스(/e0509/target_position) 대기중...')
+
+#%%Callback functions
+    # ---------------- Subscription ----------------
+    def cbtp_rgb(self, msg: Image):
+        self.image_msg = msg
+        
+    def cbtp_info(self, msg: CameraInfo):
+        if self.camera_info is None:
+            self.get_logger().info('camera_info 수신됨')
+        self.camera_info = msg
+
+    # ---------------- Service ----------------
+    def cbsrv_target_center(self, request, response):
+        self.pixel_t = request.target
+        self.pixel_u = int(request.center_x)
+        self.pixel_v = int(request.center_y)
+        self.pixel_d = float(request.distance_m)
+        
+        self.calculation_done = False
+        
         self.get_logger().info(
-            f'PixelToWorld 시작: target_frame={self.target_frame}'
+            f'TargetCenter 수신 → target={request.target}, '
+            f'pixel_u={self.pixel_u}, pixel_v={self.pixel_v}, '
+            f'distance={request.distance_m:.3f}m'
+        )
+        
+        response.success = True
+        response.message = f'Received {request.target} center point'
+        return response
+    
+    def send_world_coord(self, world_coord):
+        if not self.target_position_client.service_is_ready():
+            self.get_logger().warn('Waiting for TargetPosition service to be available...')
+            return
+        
+        req = TargetPosition.Request()
+        req.target_position.x = float(world_coord[0])
+        req.target_position.y = float(world_coord[1])
+        req.target_position.z = float(world_coord[2])
+        self.get_logger().info(
+        f'TargetPosition 요청 → x={req.target_position.x:.3f}, '
+        f'y={req.target_position.y:.3f}, '
+        f'z={req.target_position.z:.3f}'
         )
 
-        self.bridge = CvBridge()
-        self.camera_info = None
-        # self.depth_msg = None
-        self.image_msg = None
-
-        # tf buffer/listener
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.tf_broadcaster = TransformBroadcaster(self)
-
-        # 카메라 위치: 월드 원점에서 (52, 0, 71) 떨어짐
-        # self.camera_position = np.array([0, 0, 0.71])
-        self.camera_position = np.array([0.53, 0.03, 0.98])
-
-        theta_x = np.pi
-        theta_y = 0.0
-        theta_z = np.pi / 2.0
-
+        future = self.target_position_client.call_async(req)
+        future.add_done_callback(self.target_position_response_callback)
+    
+    def target_position_response_callback(self, future):
+        try:
+            res = future.result()
+            if res.success:
+                self.get_logger().info(f'TargetPosition 성공: {res.message}')
+            else:
+                self.get_logger().warn(f'TargetPosition 실패: {res.message}')
+        except Exception as e:
+            self.get_logger().error(f'TargetPosition 응답 처리 중 오류: {e}')
+       
+#%% Calculation Rotation Matrics 
+    def compute_rotation_matrices(self, theta_x, theta_y, theta_z):
         R_x = np.array([
             [1, 0, 0],
             [0, np.cos(theta_x), -np.sin(theta_x)],
@@ -71,71 +128,13 @@ class PixelToWorld(Node):
             [np.sin(theta_z),  np.cos(theta_z), 0],
             [0, 0, 1]
         ])
-
-        # 카메라 → 월드 회전 행렬
-        self.R_world_cam = R_z @ R_y @ R_x
-
-        # ---- TargetCenter 서비스 서버 생성 (YOLO로부터 중심점 받기) ----
-        self.target_center_srv = self.create_service(
-            TargetCenter,
-            'send_target_center',
-            self.target_center_callback
-        )
-        self.get_logger().info('📡 TargetCenter 서비스 서버 생성 (/send_target_center)')
-
-        # ---- MoveToPoint 서비스 클라이언트 생성 ----
-        self.move_client = self.create_client(MoveToPoint, 'move_to_point')
-        self.get_logger().info('🛰 MoveToPoint 서비스 클라이언트 생성')
-
-        # 서비스 준비될 때까지 계속 대기 (비동기)
-        while not self.move_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn('⏳ MoveToPoint 서비스(/move_to_point) 대기중...')
-
-        # subscribers
-        self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_cb, 10)
-        # self.create_subscription(Image, self.depth_topic, self.depth_cb, 10)
-        self.create_subscription(Image, self.image_topic, self.image_cb, 10)
         
-        self.timer = self.create_timer(0.1, self.try_compute_world_point)
+        R = R_z @ R_y @ R_x
 
-    # --------- TargetCenter 서비스 콜백 (YOLO로부터 중심점 받기) ---------
-    def target_center_callback(self, request, response):
-        """
-        YOLO 노드에서 TargetCenter 서비스로 전달되는 중심점 데이터 수신
-        """
-        self.pixel_t = request.target
-        self.pixel_u = int(request.center_x)
-        self.pixel_v = int(request.center_y)
-        self.pixel_d = float(request.distance_m)
-        
-        # 🚩 새로운 데이터가 들어왔으므로 계산 플래그 리셋
-        self.calculation_done = False
-        
-        self.get_logger().info(
-            f'📍 TargetCenter 수신 → target={request.target}, '
-            f'pixel_u={self.pixel_u}, pixel_v={self.pixel_v}, '
-            f'distance={request.distance_m:.3f}m'
-        )
-        
-        response.success = True
-        response.message = f'✅ Received {request.target} center point'
-        return response
+        return R
 
-    # --------- 카메라 콜백 ---------
-    def camera_info_cb(self, msg: CameraInfo):
-        if self.camera_info is None:
-            self.get_logger().info('camera_info 수신됨')
-        self.camera_info = msg
-
-    def image_cb(self, msg: Image):
-        self.image_msg = msg
-
-    # def depth_cb(self, msg: Image):
-        # self.depth_msg = msg
-
-    # --------- 월드 좌표 계산 ---------
-    def try_compute_world_point(self):
-        # 🚩 이미 계산 완료했으면 리턴
+#%% Main processing function
+    def main(self):
         if self.calculation_done:
             return
             
@@ -143,7 +142,7 @@ class PixelToWorld(Node):
         if self.camera_info is None or self.image_msg is None:    
             return
 
-        # ✅ YOLO에서 아직 픽셀 안 들어왔으면 계산 안 함
+        # YOLO에서 아직 픽셀 안 들어왔으면 계산 안 함
         if self.pixel_u is None or self.pixel_v is None or self.pixel_d is None:
             return
         
@@ -151,15 +150,14 @@ class PixelToWorld(Node):
         u = self.pixel_u
         v = self.pixel_v
         d = self.pixel_d
-        
-        self.get_logger().info(f'🔍 계산 시작 → target={target}, u={u}, v={v}, d={d:.3f}m')
+        self.get_logger().info(f'픽셀 좌표 수신: target={target}, (u,v)=({u},{v}), depth={d:.3f}m')
 
-        # depth 이미지 -> numpy (z값만 사용)
+
         try:
             rgb_img = self.bridge.imgmsg_to_cv2(self.image_msg, desired_encoding='bgr8')
         except Exception as e:
             self.get_logger().error(f'이미지 CvBridge 변환 실패: {e}')
-            self.calculation_done = True  # 실패 시에도 플래그 설정
+            self.calculation_done = True
             return
 
         # 범위 체크
@@ -176,8 +174,6 @@ class PixelToWorld(Node):
         else:
             depth_val = d
 
-        self.get_logger().info(f'📏 사용할 depth 값: {depth_val:.3f}m')
-
         # 카메라 내부 파라미터
         K = self.camera_info.k  # 3x3 row-major
         fx = K[0]
@@ -190,18 +186,18 @@ class PixelToWorld(Node):
         y_cam = (v - cy) * depth_val / fy
         z_cam = depth_val
 
-        self.get_logger().info(f'📐 카메라 프레임 좌표: x={x_cam:.4f} y={y_cam:.4f} z={z_cam:.4f} (m)')
-
         cam_coord = np.array([x_cam, y_cam, z_cam])
 
+        R = self.compute_rotation_matrices(self.theta_x, self.theta_y, self.theta_z)
+
         # 카메라 → 월드
-        world_coord = self.R_world_cam @ cam_coord + self.camera_position
+        world_coord = R @ cam_coord + self.camera_position
 
         self.get_logger().info(
-            f'🌍 월드 좌표 ({self.target_frame}): x={world_coord[0]:.4f} y={world_coord[1]:.4f} z={world_coord[2]:.4f}'
+            f'월드 좌표: x={world_coord[0]:.4f} y={world_coord[1]:.4f} z={world_coord[2]:.4f}'
         )
 
-        # 🚩 계산 완료 플래그 설정 (한 번만 계산)
+        # 계산 완료 플래그 설정 (한 번만 계산)
         self.calculation_done = True
 
         self.send_world_coord(world_coord)
@@ -225,37 +221,7 @@ class PixelToWorld(Node):
         # # 윈도우에 표시
         # cv2.imshow("Pixel to World", cv_img)
         # cv2.waitKey(1)
-        
-    def send_world_coord(self, world_coord):
-        """
-        계산된 world 좌표를 MoveToPoint 서비스로 전송
-        world_coord = [x, y, z]
-        """
-        if not self.move_client.service_is_ready():
-            self.get_logger().warn('MoveToPoint 서비스가 아직 준비 안 됨')
-            return
-        req = MoveToPoint.Request()
-        req.target_position.x = float(world_coord[0])
-        req.target_position.y = float(world_coord[1])
-        req.target_position.z = float(world_coord[2])
-        self.get_logger().info(
-        f'🚀 MoveToPoint 요청 → x={req.target_position.x:.3f}, '
-        f'y={req.target_position.y:.3f}, '
-        f'z={req.target_position.z:.3f}'
-        )
 
-        future = self.move_client.call_async(req)
-        future.add_done_callback(self.move_response_callback)
-    
-    def move_response_callback(self, future):
-        try:
-            res = future.result()
-            if res.success:
-                self.get_logger().info(f'✅ MoveToPoint 성공: {res.message}')
-            else:
-                self.get_logger().warn(f'⚠️ MoveToPoint 실패: {res.message}')
-        except Exception as e:
-            self.get_logger().error(f'❌ MoveToPoint 응답 처리 중 오류: {e}')
 
 def main(args=None):
     rclpy.init(args=args)
@@ -266,7 +232,7 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows()
         rclpy.shutdown()
 
 if __name__ == '__main__':

@@ -13,7 +13,7 @@ import numpy as np
 from datetime import datetime
 import threading
 import subprocess
-import pyaudio
+# import pyaudio
 import wave
 from difflib import SequenceMatcher
 
@@ -187,12 +187,12 @@ class ControlTowerGUI(QMainWindow):
         self.recording_time = 0
         
         # Audio 설정
-        self.CHUNK = 1024
-        self.FORMAT = pyaudio.paInt16
-        self.CHANNELS = 1
-        self.RATE = 16000
-        self.audio = pyaudio.PyAudio()
-        self.frames = []
+        # self.CHUNK = 1024
+        # self.FORMAT = pyaudio.paInt16
+        # self.CHANNELS = 1
+        # self.RATE = 16000
+        # self.audio = pyaudio.PyAudio()
+        # self.frames = []
         
         # UI 초기화
         self.init_ui()

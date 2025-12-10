@@ -24,7 +24,7 @@ setup(
     license='Apache License 2.0',
     entry_points={
         'console_scripts': [
-            'yolo_depth_viewer = yolo_realsense.yolo_depth_viewer:main',
+            'yolo_ros = yolo_realsense.yolo_ros:main',
         ],
     },
 )
