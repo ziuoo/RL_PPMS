@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'system_manager'
+package_name = 'nplace'
 
 setup(
     name=package_name,
@@ -23,9 +23,7 @@ setup(
         ],
     },
     entry_points={
-        'console_scripts': [
-            'system_manager_gui = system_manager.system_manager_gui:main',
-            'system_manager_sim = system_manager.system_manager_sim:main',
+        'console_scripts': ['nplace=nplace.nplace:main',
         ],
     },
 )
