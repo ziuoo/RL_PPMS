@@ -1,1 +1,0 @@
-system_interfaces/ObjectDepth[] objects
