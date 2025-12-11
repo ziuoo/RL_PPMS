@@ -58,11 +58,11 @@ class System_Manager(Node):
         self.yolo_image = None
         
         self.object_poses = {
-                            'bottle': {'z': 0.19, 'qx': 0.0, 'qy': -0.7071, 'qz': 0.0, 'qw': 0.7071},
-                            'medicine': {'z': 0.2, 'qx': 1.0, 'qy': 0.0, 'qz': 0.0, 'qw': 0.0},
-                            'sanitizer': {'z': 0.16, 'qx': 0.0, 'qy': -0.7071, 'qz': 0.0, 'qw': 0.7071},
-                            'tissue': {'z': 0.27, 'qx': 1.0, 'qy': 0.0, 'qz': 0.0, 'qw': 0.0},
-                            'syringe': {'z': 0.12, 'qx': 1.0, 'qy': 0.0, 'qz': 0.0, 'qw': 0.0}
+                            'bottle': {'z': 0.19, 'qx': 0.0, 'qy': 1.0, 'qz': 0.0, 'qw': 0.0},
+                            'medicine': {'z': 0.2, 'qx': 0.0, 'qy': 1.0, 'qz': 0.0, 'qw': 0.0},
+                            'sanitizer': {'z': 0.16, 'qx': 0.0, 'qy': 1.0, 'qz': 0.0, 'qw': 0.0},
+                            'tissue': {'z': 0.27, 'qx': 0.0, 'qy': 1.0, 'qz': 0.0, 'qw': 0.0},
+                            'syringe': {'z': 0.12, 'qx': 0.0, 'qy': 1.0, 'qz': 0.0, 'qw': 0.0}
                             }
         
         self.object_gripper_values = {
@@ -91,19 +91,17 @@ class System_Manager(Node):
         # Subscribers
         self.create_subscription(JointState, '/dsr01/joint_states', self.cbfnc_joint_state, qos)
         self.create_subscription(Image, '/yolo/detection_image', self.cbfnc_yolo_image, qos)
-
-        # Publishers
-        # self.pub_mini_0_cmd = self.create_publisher(Twist, '/mini_0_cmd', qos)
         
         # Service Clients
         self.cli_set_target = self.create_client(SetTarget, '/e0509/set_target')
         self.cli_target_pose = self.create_client(TargetPose, '/e0509/target_pose')
+        self.cli_pick_pose = self.create_client(TargetPose, '/e0509/pick_pose')
         self.cli_gripper_value = self.create_client(GripperValue, '/e0509/gripper_value')
         
         # Service Servers
         self.srv_target_position = self.create_service(TargetPosition, '/e0509/target_position', self.srvcb_target_position)
         self.srv_move_done = self.create_service(MoveDone, '/e0509/move_done', self.srvcb_move_done)
-        # self.srv_gripper_done = self.create_service(MoveDone, '/e0509/gripper_done', self.srvcb_gripper_done)
+        self.srv_gripper_done = self.create_service(MoveDone, '/e0509/gripper_done', self.srvcb_gripper_done)
         
         self.get_logger().info('System Manager 초기화 완료')
 
@@ -195,6 +193,48 @@ class System_Manager(Node):
             if self.gui_callback:
                 self.gui_callback(f'서비스 오류: {str(e)}')
     
+    def call_pick_pose_service(self, x, y, z, qx, qy, qz, qw):
+        """PickPose 서비스 호출"""
+        if not self.cli_pick_pose.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn('PickPose 서비스를 사용할 수 없습니다.')
+            if self.gui_callback:
+                self.gui_callback('PickPose 서비스 연결 실패')
+            return
+        
+        request = TargetPose.Request()
+        request.target_pose.position.x = x
+        request.target_pose.position.y = y
+        request.target_pose.position.z = z
+        request.target_pose.orientation.x = qx
+        request.target_pose.orientation.y = qy
+        request.target_pose.orientation.z = qz
+        request.target_pose.orientation.w = qw
+        
+        future = self.cli_pick_pose.call_async(request)
+        future.add_done_callback(self.pick_pose_callback)
+        
+        self.get_logger().info(f'PickPose 서비스 호출: pos=({x:.2f}, {y:.2f}, {z:.2f})')
+        if self.gui_callback:
+            self.gui_callback(f'픽업 위치 전송: ({x:.2f}, {y:.2f}, {z:.2f})')
+    
+    def pick_pose_callback(self, future):
+        """PickPose 서비스 응답 콜백"""
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f'픽업 이동 명령 전송 성공: {response.message}')
+                if self.gui_callback:
+                    self.gui_callback(f'픽업 이동 명령 전송: {response.message}')
+            else:
+                self.b_move = False
+                self.get_logger().warn(f'픽업 이동 명령 실패: {response.message}')
+                if self.gui_callback:
+                    self.gui_callback(f'픽업 이동 명령 실패: {response.message}')
+        except Exception as e:
+            self.get_logger().error(f'픽업 이동 명령 오류: {str(e)}')
+            if self.gui_callback:
+                self.gui_callback(f'서비스 오류: {str(e)}')
+    
     def call_gripper_value_service(self, value):
         """GripperValue 서비스 호출"""
         if not self.cli_gripper_value.wait_for_service(timeout_sec=1.0):
@@ -214,14 +254,13 @@ class System_Manager(Node):
             self.gui_callback(f'그리퍼 값 전송: {value}')
     
     def gripper_value_callback(self, future):
-        """GripperValue 서비스 응답 콜백 - 1초 대기 후 완료 처리"""
+        """GripperValue 서비스 응답 콜백 - gripper_done 대기"""
         try:
             response = future.result()
             if response.success:
                 self.get_logger().info(f'Gripper Control 명령 전송 완료: {response.message}')
-                self.get_logger().info('⏳ 그리퍼가 물체를 완전히 잡을 때까지 1초 대기...')
-                # 1초 후에 b_gripper를 True로 설정
-                self._gripper_wait_timer = self.create_timer(1.0, self._gripper_complete)
+                self.get_logger().info('⏳ 그리퍼 컨트롤러로부터 완료 신호 대기 중...')
+                # b_gripper는 gripper_done 서비스에서 설정됨
             else:
                 self.get_logger().warn(f'Gripper Control 실패: {response.message}')
                 self.b_gripper = False
@@ -233,14 +272,14 @@ class System_Manager(Node):
             if self.gui_callback:
                 self.gui_callback(f'Gripper 서비스 오류: {str(e)}')
     
-    def _gripper_complete(self):
-        """그리퍼 동작 완료 (1초 대기 후)"""
-        self.b_gripper = True
-        self.get_logger().info('✅ 그리퍼 동작 완료 (1초 대기 완료)')
-        # 타이머 취소 (한 번만 실행)
-        if hasattr(self, '_gripper_wait_timer'):
-            self._gripper_wait_timer.cancel()
-            del self._gripper_wait_timer
+    # def _gripper_complete(self):
+    #     """그리퍼 동작 완료 (1초 대기 후)"""
+    #     self.b_gripper = True
+    #     self.get_logger().info('✅ 그리퍼 동작 완료 (1초 대기 완료)')
+    #     # 타이머 취소 (한 번만 실행)
+    #     if hasattr(self, '_gripper_wait_timer'):
+    #         self._gripper_wait_timer.cancel()
+    #         del self._gripper_wait_timer
     
     def start_voice_recognition(self):
         """GUI에서 직접 호출: 음성인식 시작 (TODO: 기능 구현)"""
@@ -295,27 +334,32 @@ class System_Manager(Node):
         response.message = "Move done received"
         return response
     
-    # def srvcb_gripper_done(self, request, response):
-    #     """GripperDone 서비스 콜백 - 외부 노드로부터 그리퍼 완료 수신"""
-    #     self.b_gripper = request.done
+    def srvcb_gripper_done(self, request, response):
+        """GripperDone 서비스 콜백 - 외부 노드로부터 그리퍼 완료 수신"""
+        self.b_gripper = request.done
         
-    #     if self.b_gripper:
-    #         if self.gui_callback:
-    #             self.gui_callback('✅ 그리퍼 동작 완료')
+        if self.b_gripper:
+            self.get_logger().info('✅ 그리퍼 동작 완료 수신')
+            if self.gui_callback:
+                self.gui_callback('✅ 그리퍼 동작 완료')
         
-    #     response.success = True
-    #     response.message = "Gripper done received"
-    #     return response
+        response.success = True
+        response.message = "Gripper done received"
+        return response
 
     # Main functions
     def main(self):
         """타이머에 의해 10Hz로 자동 호출되는 메인 로직"""
+        
         if not self.b_state or not self.b_go:
             return
         
         # 객체가 선택되지 않았으면 대기
         if self.selected_object is None:
             return
+        
+        # 플래그 상태 로깅 (디버깅용)
+        self.get_logger().info(f'🔍 [State: {self.task_state}] b_move={self.b_move}, b_gripper={self.b_gripper}, b_target_received={self.b_target_received}')
         
         # === 상태 머신 ===
         if self.task_state == 'IDLE':
@@ -328,10 +372,10 @@ class System_Manager(Node):
             # YOLO로부터 타겟 위치 수신 대기
             if self.b_target_received:
                 pose = self.object_poses.get(self.selected_object, 
-                                    {'z': 0.1, 'qx': 0.0, 'qy': 0.0, 'qz': 0.0, 'qw': 1.0})
+                                    {'z': 0.1, 'qx': 0.0, 'qy': 1.0, 'qz': 0.0, 'qw': 0.0})
                 
                 # 픽업 위치로 이동 명령
-                self.call_target_pose_service(
+                self.call_pick_pose_service(
                     self.target_x, self.target_y, pose['z'],
                     pose['qx'], pose['qy'], pose['qz'], pose['qw']
                 )
@@ -346,6 +390,7 @@ class System_Manager(Node):
             if self.b_move:
                 # 그리퍼 닫기 (물체 잡기)
                 gripper_value = self.object_gripper_values.get(self.selected_object, 30)
+                self.get_logger().info(f'griper close value: {gripper_value}')
                 self.call_gripper_value_service(gripper_value)
                 self.task_state = 'PICK_GRIP'
                 self.b_move = False
@@ -369,6 +414,7 @@ class System_Manager(Node):
                 self.task_state = 'PICK_LIFT'
                 self.b_move = False
                 self.b_gripper = False
+                self.b_gripper = False
                 self.get_logger().info('📌 State: PICK_GRIP -> PICK_LIFT')
                 if self.gui_callback:
                     self.gui_callback('⬆️ 물체를 들어올립니다.')
@@ -383,7 +429,7 @@ class System_Manager(Node):
                     self.place_pose['qz'], self.place_pose['qw']
                 )
                 self.task_state = 'PLACE_MOVE'
-                self.b_move = False
+                self.b_move = False  # 이동 명령 후 반드시 리셋!
                 self.get_logger().info('📌 State: PICK_LIFT -> PLACE_MOVE')
                 if self.gui_callback:
                     self.gui_callback('📍 배치 위치로 이동합니다.')
@@ -394,7 +440,6 @@ class System_Manager(Node):
                 # 그리퍼 열기 (물체 놓기)
                 self.call_gripper_value_service(200)
                 self.task_state = 'PLACE_RELEASE'
-                self.b_move = False
                 self.b_gripper = False
                 self.get_logger().info('📌 State: PLACE_MOVE -> PLACE_RELEASE')
                 if self.gui_callback:
@@ -410,7 +455,7 @@ class System_Manager(Node):
                     self.home_pose['qz'], self.home_pose['qw']
                 )
                 self.task_state = 'HOME'
-                self.b_move = False
+                # self.b_move = False
                 self.b_gripper = False
                 self.get_logger().info('📌 State: PLACE_RELEASE -> HOME')
                 if self.gui_callback:
